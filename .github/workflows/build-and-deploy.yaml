@@ -1,0 +1,131 @@
+name: Build and deploy
+
+on:
+  # Build daily, offset by one hour to be able to use the latest
+  # arch-repo-create Docker image (which gets built daily at 00:00 UTC)
+  schedule:
+    - cron: '0 1 * * 1'
+  push:
+    branches:
+      - 'master'
+    paths:
+      - 'packages/**'
+      - 'README.md'
+  pull_request:
+    branches:
+      - 'master'
+    paths:
+      - 'packages/**'
+      - 'README.md'
+  workflow_dispatch:
+
+env:
+  REPOSITORY_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  build:
+    name: Build packages and create repository
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Git repository
+      uses: actions/checkout@v6
+
+    - name: Create repository directory
+      run: |
+        mkdir -p ./repository
+
+    # We check if the workflow was not triggered by a schedule, in which case
+    # we always want to recreate the repository
+    # If it was triggered by a schedule, we check if today is Monday; if yes,
+    # we also want to recreate the repository
+    - name: Check if repository should be recreated
+      id: check-recreate
+      run: |
+        if [[ "${{ github.event_name }}" != "schedule" ]]; then
+          echo "result=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        if [[ "$(date +%u)" -eq 1 ]]; then
+          echo "result=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "result=false" >> $GITHUB_OUTPUT
+
+    # If we aren't recreating the repository from scratch, we need to download
+    # the existing repository files so we can reuse them
+    - name: Download existing repository
+      if: steps.check-recreate.outputs.result == 'false'
+      run: |
+        curl -o repository_files.txt https://${{ env.REPOSITORY_NAME }}/repository_files.txt
+
+        while read -r file; do
+          curl -o ./repository/"$file" https://${{ env.REPOSITORY_NAME }}/"$file"
+        done < repository_files.txt
+
+    # If this step runs, we are not doing a full repository rebuild, so we find
+    # all packages that are not VCS packages and remove them since they should
+    # not be rebuilt daily
+    - name: Restrict build to VCS packages
+      if: steps.check-recreate.outputs.result == 'false'
+      run: |
+        find ./packages -mindepth 1 -maxdepth 1 -type d ! -name '*-git' ! -name '*-svn' ! -name '*-hg' ! -name '*-bzr' ! -name '*-cvs' -exec rm -rf {} +
+
+    # We build the packages and create the repository using a Docker container
+    - name: Build packages and create repository
+      run: |
+        echo REPOSITORY_NAME="${{ env.REPOSITORY_NAME }}" >> ./docker-env
+        echo GPG_PRIVATE_KEY="${{ secrets.GPG_PRIVATE_KEY }}" >> ./docker-env
+        echo GPG_PASSPHRASE="${{ secrets.GPG_PASSPHRASE }}" >> ./docker-env
+        docker run \
+          -v ${{ github.workspace }}/packages:/packages:ro \
+          -v ${{ github.workspace }}/repository:/repository \
+          --env-file ./docker-env \
+          --user $(id -u):$(id -g) \
+          ghcr.io/mserajnik/arch-repo-create
+
+    # We create a list of files in the repository so we can download and reuse
+    # reuse them in subsequent runs when we don't want to recreate the
+    # repository from scratch
+    - name: Create list of files in repository
+      run: |
+        cd ./repository
+        find . -maxdepth 1 -xtype f ! -name 'repository_files.txt' -exec basename {} \; > repository_files.txt
+
+    - name: Generate index.html file
+      uses: jaywcjlove/markdown-to-html-cli@main
+      with:
+        source: README.md
+        output: repository/index.html
+        title: pkg.mser.at
+        description: My personal Arch Linux package repository
+        favicon: data:image/png;base64,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
+        github-corners: https://github.com/mserajnik/pkg.mser.at
+
+    - name: Generate CNAME file
+      run: |
+        cd ./repository
+        echo "pkg.mser.at" > CNAME
+
+    - name: Upload package repository as artifact
+      uses: actions/upload-pages-artifact@v4
+      with:
+        path: repository/
+
+  deploy:
+    name: Deploy repository
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+
+    steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
