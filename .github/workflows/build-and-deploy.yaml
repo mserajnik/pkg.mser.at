@@ -1,0 +1,131 @@
+name: Build and deploy
+
+on:
+  # Build daily, offset by one hour to be able to use the latest
+  # arch-repo-create Docker image (which gets built daily at 00:00 UTC).
+  schedule:
+    - cron: '0 1 * * 1'
+  push:
+    branches:
+      - 'master'
+    paths:
+      - 'packages/**'
+      - 'README.md'
+  pull_request:
+    branches:
+      - 'master'
+    paths:
+      - 'packages/**'
+      - 'README.md'
+  workflow_dispatch:
+
+env:
+  REPOSITORY_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  build:
+    name: Build packages and repository
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Git repository
+      uses: actions/checkout@v4
+
+    - name: Create repository directory
+      run: |
+        mkdir -p ./repository
+
+    - name: Check if repository should be rebuilt
+      id: check-rebuild
+      run: |
+        # Check if the workflow was not triggered by a schedule, in which case
+        # we always want to rebuild the repository.
+        if [[ "${{ github.event_name }}" != "schedule" ]]; then
+          echo "result=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Check if today is Monday, in which case we also want to rebuild the
+        # repository.
+        if [[ "$(date +%u)" -eq 1 ]]; then
+          echo "result=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "result=false" >> $GITHUB_OUTPUT
+
+    - name: Download existing repository
+      if: steps.check-rebuild.outputs.result == 'false'
+      run: |
+        curl -o repository_files.txt https://${{ env.REPOSITORY_NAME }}/repository_files.txt
+
+        while read -r file; do
+          curl -o ./repository/"$file" https://${{ env.REPOSITORY_NAME }}/"$file"
+        done < repository_files.txt
+
+        cd ./repository
+
+        # Define symlinks to create
+        declare -A symlinks=(
+          ["${{ env.REPOSITORY_NAME }}.db"]="${{ env.REPOSITORY_NAME }}.db.tar.gz"
+          ["${{ env.REPOSITORY_NAME }}.db.sig"]="${{ env.REPOSITORY_NAME }}.db.tar.gz.sig"
+          ["${{ env.REPOSITORY_NAME }}.files"]="${{ env.REPOSITORY_NAME }}.files.tar.gz"
+          ["${{ env.REPOSITORY_NAME }}.files.sig"]="${{ env.REPOSITORY_NAME }}.files.tar.gz.sig"
+        )
+
+        # Loop through the symlinks array and create them
+        for symlink in "${!symlinks[@]}"; do
+          target="${symlinks[$symlink]}"
+          ln -sf "$target" "$symlink" \
+            && echo "Created symlink: $symlink -> $target" || echo "Target not found: $target"
+        done
+
+        cd ..
+
+    - name: Restrict build to VCS packages
+      if: steps.check-rebuild.outputs.result == 'false'
+      run: |
+        # Find all packages that are not VCS packages and remove them since
+        # they should not be rebuilt daily.
+        find ./packages -mindepth 1 -maxdepth 1 -type d ! -name '*-git' -exec rm -rf {} +
+
+    - name: Build repository
+      run: |
+        echo REPOSITORY_NAME="${{ env.REPOSITORY_NAME }}" >> ./docker-env
+        echo GPG_PRIVATE_KEY="${{ secrets.GPG_PRIVATE_KEY }}" >> ./docker-env
+        echo GPG_PASSPHRASE="${{ secrets.GPG_PASSPHRASE }}" >> ./docker-env
+        docker run \
+          -v ${{ github.workspace }}/packages:/packages:ro \
+          -v ${{ github.workspace }}/repository:/repository \
+          --env-file ./docker-env \
+          --user $(id -u):$(id -g) \
+          ghcr.io/mserajnik/arch-repo-create
+
+    - name: Create list of files in repository
+      run: |
+        cd ./repository
+        # We create a list of files in the repository so we can download and
+        # reuse them in subsequent runs when we don't want to rebuild the
+        # repository.
+        find . -maxdepth 1 -type f ! -name 'repository_files.txt' -exec basename {} \; > repository_files.txt
+
+    - name: Upload package repository as artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: repository/
+
+  deploy:
+    name: Deploy repository
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+
+    steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
